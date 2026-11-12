@@ -9,13 +9,16 @@ place, and the best guess at the top 10 in order.
 Model (standard library only, deterministic, offline):
   * Every game on the chart follows a lifecycle: it enters deep in the chart,
     climbs while young and hot, peaks, then fades as it ages and drops off.
-    Rank velocity measured on the archive: young games at ranks 50-80 climb
-    ~0.2-0.5 places/hour; games older than ~2 days drift down ~0.2-0.4/hr;
-    top-10 games are nearly flat with noise (sd ~1.2 places/hr).
-  * Each game's rank is simulated forward as a random walk with
-    age/rank-dependent drift, a persistent momentum term (recent velocity,
-    shrunk, fading over ~12 h), Gaussian noise and occasional viral
-    surge/crash jumps. A fixed seed makes two runs byte-identical.
+    The rank drift is estimated from the input history at run time as the
+    mean rank change per hour in each (age, rank) bin, shrunk toward a
+    hand-tuned prior by sample count. Measured on the archive: young games
+    at ranks 61+ climb ~0.58 places/hour; games older than ~2 days at ranks
+    11-60 drift down ~0.21-0.27/hour; top-10 games are nearly flat.
+  * Each game's rank is simulated forward as a random walk with that drift,
+    a persistent momentum term (recent velocity, shrunk, fading over ~12 h)
+    and Gaussian noise (sd 1.0 places per sqrt-hour, tuned on backtests).
+    Viral surge/crash jumps are disabled (tuned to 0: they add spread that
+    is not real). A fixed seed makes two runs byte-identical.
   * 1200 Monte Carlo draws x every hour of the 72-hour scored window:
     at each draw-hour the games are ordered by simulated rank and the top 10
     recorded. Averaging over draws and hours gives each game's probability
@@ -23,9 +26,10 @@ Model (standard library only, deterministic, offline):
     mixture over hours is the honest single forecast).
   * Brand-new games (not on the chart at the cut) cannot be named, so a
     calibrated share of each place is left unnamed: measured on the archive,
-    ~0% of top-10 slots at +24 h but 20-50% at +72 h are games not on the
-    cut chart, about half of them brand-new. The unnamed share grows with
-    place (new games reach the bottom of the top 10 more often than #1).
+    ~10% of top-10 slots at +24 h but 20-40% at +31-42 h are games not on
+    the cut chart. The unnamed share grows with place (new games reach the
+    bottom of the top 10 more often than #1). Targets (0.04-0.16 per place)
+    are scaled x2.5, the value that scored best on six backtest cuts.
   * A game is named at a place only when its probability beats the
     per-game unnamed share it would otherwise receive; named probabilities
     are scaled so each place keeps its target unnamed share.
@@ -45,12 +49,25 @@ OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
 SEED = 20261113
 N_DRAWS = int(os.environ.get("MAKEFUN_N_DRAWS", "1200"))
-UNNAMED_SCALE = float(os.environ.get("MAKEFUN_UNNAMED_SCALE", "2.0"))
+UNNAMED_SCALE = float(os.environ.get("MAKEFUN_UNNAMED_SCALE", "2.5"))
 MOMENTUM_ON = os.environ.get("MAKEFUN_MOMENTUM", "1") != "0"
-NOISE_SD = 1.15          # places per sqrt(hour), measured sd of rank velocity
-JUMP_PROB = 0.015        # per game-hour: viral surge / crash
+NOISE_SD = float(os.environ.get("MAKEFUN_NOISE_SD", "1.0"))  # places per sqrt(hour); tuned on backtests (measured sd 1.20, but 1.0 scores better: the rank walk already spreads via drift + momentum)
+JUMP_PROB = float(os.environ.get("MAKEFUN_JUMP_PROB", "0"))  # per game-hour: viral surge / crash; tuned to 0 on backtests (jumps add spread that is not real: the measured rank velocity is already Gaussian-like)
 JUMP_MIN, JUMP_MAX = 3.0, 9.0
 CHART_MAX_RANK = 115.0   # beyond this a game has effectively left the chart
+
+# Drift table: empirical mean rank change/hr per (age, rank) bin, estimated
+# from the input history at run time and shrunk toward the hand-tuned prior.
+# Age bins (hours since first seen): <24, 24-48, 48-96, >96.
+# Rank bins: 1-10, 11-30, 31-60, 61+.
+# Measured on the archive: young deep games climb far faster than the old
+# hand-tuned formula allowed (61+ at age <24h: -0.58/hr vs -0.25), while old
+# games at ranks 11-60 drift down ~+0.21-0.27/hr. The table is re-estimated
+# from whatever history the entry is given, so it adapts to the final data.
+AGE_EDGES = (24.0, 48.0, 96.0)
+RANK_EDGES = (10.0, 30.0, 60.0)
+DRIFT_PRIOR_K = float(os.environ.get("MAKEFUN_DRIFT_PRIOR_K", "30"))
+DRIFT_MODE = os.environ.get("MAKEFUN_DRIFT_MODE", "empirical")  # or "prior"
 
 # Target unnamed share per place (1..10): probability mass reserved for
 # games not on the chart at the cut (brand-new entrants). Grows with place:
@@ -144,34 +161,94 @@ def build_games(snaps):
     return games, t0
 
 
-def drift(rank, age_h, momentum):
-    """Expected rank change per hour (negative = climbing)."""
-    # Age drift: young games hold/climb, old games fade.
+def _age_bin(age_h):
+    if age_h < AGE_EDGES[0]:
+        return 0
+    if age_h < AGE_EDGES[1]:
+        return 1
+    if age_h < AGE_EDGES[2]:
+        return 2
+    return 3
+
+
+def _rank_bin(rank):
+    if rank <= RANK_EDGES[0]:
+        return 0
+    if rank <= RANK_EDGES[1]:
+        return 1
+    if rank <= RANK_EDGES[2]:
+        return 2
+    return 3
+
+
+def _prior_drift(age_h, rank):
+    """The hand-tuned drift of the original model: used as the prior for
+    (age, rank) bins with few observations in the input history."""
     if age_h < 24.0:
         age_d = 0.0
     elif age_h < 48.0:
         age_d = 0.08
     else:
         age_d = 0.25
-    # Climb bonus for young games deep in the chart.
     if age_h < 36.0 and rank > 20.0:
         climb = -0.25 * min(1.0, (rank - 20.0) / 40.0)
     else:
         climb = 0.0
-    # It is hard to hold the very top: slight downward pressure there.
     if rank <= 3.0:
         top = 0.08
     elif rank <= 10.0:
         top = 0.03
     else:
         top = 0.0
-    # Very deep, older games drift off the chart.
     deep = 0.15 if (rank > 85.0 and age_h >= 24.0) else 0.0
-    d = age_d + climb + top + deep + momentum
-    return max(-0.6, min(0.55, d))
+    return max(-0.6, min(0.55, age_d + climb + top + deep))
 
 
-def simulate(games, last_chart, t_last, win_from, win_until, places, n_draws):
+def estimate_drift_table(games):
+    """Empirical mean rank change/hr per (age, rank) bin from the input
+    history, shrunk toward the hand-tuned prior by sample count.
+    Returns (table, counts): table is a 4x4 list of drift values."""
+    sums = [[0.0] * 4 for _ in range(4)]
+    ns = [[0] * 4 for _ in range(4)]
+    for g in games.values():
+        obs = g["obs"]
+        if len(obs) < 2:
+            continue
+        first_t = obs[0][0]
+        for (t1, r1, _), (t2, r2, _) in zip(obs, obs[1:]):
+            dt = t2 - t1
+            if dt <= 0 or dt > 24:
+                continue
+            a = _age_bin(t1 - first_t)
+            b = _rank_bin(r1)
+            sums[a][b] += (r2 - r1) / dt
+            ns[a][b] += 1
+    age_c = (12.0, 36.0, 72.0, 144.0)
+    rank_c = (5.0, 20.0, 45.0, 80.0)
+    table = [[0.0] * 4 for _ in range(4)]
+    for a in range(4):
+        for b in range(4):
+            prior = _prior_drift(age_c[a], rank_c[b])
+            n = ns[a][b]
+            if DRIFT_MODE == "prior" or n == 0:
+                table[a][b] = prior
+            else:
+                emp = sums[a][b] / n
+                table[a][b] = (n * emp + DRIFT_PRIOR_K * prior) / (n + DRIFT_PRIOR_K)
+    return table, ns
+
+
+def drift(rank, age_h, momentum, table=None):
+    """Expected rank change per hour (negative = climbing)."""
+    if table is not None:
+        d = table[_age_bin(age_h)][_rank_bin(rank)]
+    else:
+        d = _prior_drift(age_h, rank)
+    return max(-0.6, min(0.55, d + momentum))
+
+
+def simulate(games, last_chart, t_last, win_from, win_until, places, n_draws,
+             table=None):
     """Monte Carlo over rank trajectories.
 
     Returns counts[uid][place] = number of (draw, hour) pairs where the game
@@ -223,7 +300,7 @@ def simulate(games, last_chart, t_last, win_from, win_until, places, n_draws):
             mom_scale = 1.0 if h <= 12 else max(0.0, 1.0 - (h - 12) / 24.0)
             for i in range(n):
                 age = init_age[i] + h
-                mu = drift(ranks[i], age, init_mom[i] * mom_scale)
+                mu = drift(ranks[i], age, init_mom[i] * mom_scale, table)
                 nr = ranks[i] + mu + gauss(0.0, NOISE_SD)
                 if rnd() < JUMP_PROB:
                     nr += uniform(JUMP_MIN, JUMP_MAX) * (1.0 if rnd() < 0.5 else -1.0)
@@ -306,6 +383,7 @@ def main():
     win_until = _parse_time(win["until"]) if "until" in win else win_from
 
     games, t0 = build_games(snaps)
+    drift_table, _drift_ns = estimate_drift_table(games)
     last = snaps[-1]
     t_last = _parse_time(last["at"])
     last_chart = [r["universe_id"] for r in sorted(last["up_and_coming"],
@@ -316,7 +394,7 @@ def main():
         last_chart = sorted(games, key=lambda u: games[u]["last_rank"])[:100]
 
     counts, n_hours = simulate(games, last_chart, t_last, win_from,
-                               win_until, places, N_DRAWS)
+                               win_until, places, N_DRAWS, drift_table)
     forecast = build_forecast(counts, n_hours, places)
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
